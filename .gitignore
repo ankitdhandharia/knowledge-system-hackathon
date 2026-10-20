@@ -4,3 +4,6 @@ __pycache__/
 .DS_Store
 .env
 snapshots/0*/
+# website snapshots are supplied by the organisers and must not be committed
+snapshots_zip/
+*.zip

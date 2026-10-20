@@ -93,6 +93,10 @@ NUM_RX = re.compile(r"\b\d[\d,]*\b")
 TYPE_WORDS = frozenset(stem(w) for w in ("address", "located", "location", "phone", "telephone", "number", "call",
                                           "hours", "hour", "routing", "open", "close"))
 
+MONTH_NAMES = ["january", "february", "march", "april", "may", "june", "july", "august", "september",
+               "october", "november", "december", "jan", "feb", "mar", "apr", "jun", "jul", "aug", "sept", "sep",
+               "oct", "nov", "dec"]
+
 REFUSAL = ("I'm sorry, but that isn't listed on the website, so I can't confirm it. "
            "Please contact us or visit a branch and a Dupaco team member can help.")
 
@@ -137,6 +141,8 @@ def _short_header(h: str) -> str:
         return "dividend rate" + (" " + hl.split("rate", 1)[1].strip() if "month" in hl or "after" in hl else "")
     if hl.strip() in ("rate", "interest rate"):
         return "rate"
+    if hl.strip() in ("value", "item", "amount", ""):
+        return ""
     return h
 
 
@@ -190,7 +196,12 @@ class Answerer:
                 when = qd
         sidx = self.s.snapshot_for(when)
         toks = tokens(text)
-        content = [t for t in toks if t not in GENERIC and not re.fullmatch(r"[\d.,/]+", t)]
+        # date phrases ("in January 2026", "as of May") pick the snapshot; they are not product words
+        dated = re.sub(r"\b(as of|in|during|on|back in|for|since|before|after)?\s*(" + "|".join(MONTH_NAMES) +
+                       r")\.?(\s+\d{1,2})?,?(\s+20\d\d)?\b", " ", text, flags=re.I)
+        dated = re.sub(r"\b(last|this|next) (year|month|week)\b|\btoday\b|\bright now\b", " ", dated, flags=re.I)
+        dtoks = set(tokens(dated))
+        content = [t for t in toks if t in dtoks and t not in GENERIC and not re.fullmatch(r"[\d.,/]+", t)]
         weights: dict = defaultdict(float)
         for t in toks:
             weights[t] = max(weights[t], 0.35 if t in GENERIC else 0.6 if re.fullmatch(r"[\d.,/]+", t) else 1.0)
@@ -265,6 +276,8 @@ class Answerer:
         c = self._table_ctx(t, pv)
         num = den = 0.0
         for tok in set(q.content):
+            if tok not in idf and not any(a in idf for a in SYN.get(tok, [])) and len(self.s.postings.get(tok, ())) < 3:
+                continue    # word unknown to the whole site: it cannot discriminate between tables
             w = idf.get(tok, 2.5)
             den += w
             alts = [tok] + SYN.get(tok, [])

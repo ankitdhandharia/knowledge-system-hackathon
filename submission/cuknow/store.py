@@ -215,7 +215,7 @@ class Store:
                 flush()
             elif ln not in self.boiler:
                 cur.append(ln)
-                kv = re.match(r"^([A-Za-z][^:|]{2,80}):\s+(.*\d.*)$", ln)
+                kv = re.match(r"^([A-Za-z0-9][^:|]{2,80}):\s+(.*\d.*)$", ln)
                 if kv and pv.kind not in ("blog", "news", "calculator", "listing") and re.search(r"\d%|\$\d", kv.group(2)) and len(kv.group(2)) < 90:
                     self._add_table(pv, taken, lines, i, i, heading, ["Item", "Value"],
                                     [[clean_cell(kv.group(1)), clean_cell(kv.group(2))]], kv_line=True)
