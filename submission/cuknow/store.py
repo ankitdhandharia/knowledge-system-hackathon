@@ -324,10 +324,10 @@ class Store:
                 continue
             cells.append(c)
         lab = " ".join(cells).lower().replace("–", "-").replace("—", "-")
-        lab = re.sub(r"\b(19|20)\d\d\s*-\s*\d\d(\d\d)?\b", "YR", lab)
+        lab = re.sub(r"\b(19|20)\d\d\s*-\s*\d\d(\d\d)?\b", " yr ", lab)
         lab = re.sub(r"(\d),(\d)", r"\1\2", lab)
         lab = re.sub(r"\.00\b", "", lab)
-        return re.sub(r"[^a-z0-9$+ ]+", " ", lab).strip()
+        return re.sub(r"\s+", " ", re.sub(r"[^a-z0-9$+ ]+", " ", lab)).strip()
 
     def _assign_families(self) -> None:
         """Group tables that describe the same product (same row labels) so stale copies on

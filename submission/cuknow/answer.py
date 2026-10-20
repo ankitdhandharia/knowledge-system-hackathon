@@ -52,7 +52,7 @@ GENERIC_RAW = {"current", "currently", "today", "right", "now", "much", "offer",
            "annual", "number", "kind", "type", "option", "new", "standard", "look", "find", "see", "show",
            "charge", "month", "year", "like", "would", "let", "repeat", "say", "said", "quote", "give", "us",
            "list", "tell", "time", "most", "best", "highest", "lowest", "top", "minimum", "maximum", "cheapest",
-               "tier", "tiers", "balance", "dupaco", "aprs", "apys", "use", "should", "go", "link", "url", "website",
+               "tier", "tiers", "balance", "many", "dupaco", "aprs", "apys", "use", "should", "go", "link", "url", "website",
                "web", "page", "site", "online", "become", "currently", "info", "information", "details"}
 GENERIC = {stem(w) for w in GENERIC_RAW}
 RATE_STEMS = {stem(w) for w in RATE_WORDS}
@@ -525,10 +525,9 @@ class Answerer:
         return norm_space(" ".join(s for _, _, s in keep))
 
     def _page_sentences(self, q: Query, u: Unit, pv: PageVersion, k: int = 3) -> str:
-        """Best sentences from the chosen page: the chosen passage is favoured, a news lead paragraph
-        is favoured, and the output keeps page order."""
-        if len(u.text) <= 320 and self._coverage(q, u.text) >= 0.99:
-            return norm_space(u.text.replace("\n", " "))
+        """Best sentences from the chosen page: the chosen passage and a news lead are favoured,
+        'This/It ...' follow-on sentences are kept with their antecedent, output keeps page order."""
+        definitional = bool(re.match(r"\s*(what|who)('s| is| are| was)\b", q.text, re.I))
         cands = []
         for uid in self.s.page_units.get(pv.pid, [u.uid]):
             v = self.s.units[uid]
@@ -541,15 +540,24 @@ class Answerer:
             for j, sent in enumerate(sents):
                 if len(sent) < 25 and v.uid != u.uid:
                     continue
-                sc = self._coverage(q, sent) + (0.35 if v.uid == u.uid else 0.0)
+                sc = self._coverage(q, sent + " " + v.heading) * 0.8 + self._coverage(q, sent) * 0.2 \
+                    + (0.35 if v.uid == u.uid else 0.0)
                 if pv.kind == "news" and v.pos <= 1:
                     sc += 0.15
                 sc -= 0.004 * v.pos
-                cands.append((sc, v.pos, j, sent))
+                cands.append([sc, v.pos, j, sent])
         if not cands:
             return self._best_sentences(q, u.text, k=k)
+        if definitional:   # the first full mention usually is the definition
+            mx = max(c[0] for c in cands)
+            first = min((c for c in cands if c[0] >= mx - 0.36), key=lambda c: (c[1], c[2]))
+            first[0] += 0.3
         top = sorted(cands, key=lambda x: (-x[0], x[1], x[2]))[:k]
         top = [c for c in top if c[0] >= top[0][0] - 0.6]
+        chosen = {(c[1], c[2]) for c in top}
+        for c in cands:   # keep anaphoric follow-ons ("This initiative provides ...")
+            if (c[1], c[2] - 1) in chosen and re.match(r"(This|It|These|They|The program|The account|The loan)\b", c[3]):
+                top.append(c)
         return norm_space(" ".join(c[3] for c in sorted(top, key=lambda x: (x[1], x[2]))))
 
     def _entities(self, q: Query) -> list[str]:
@@ -598,8 +606,15 @@ class Answerer:
             ans = lines[0]
             if ents:
                 ans = f"The {' '.join(w.capitalize() for w in ents[0].split())} branch is at {ans}."
+        elif kind in ("routing", "phone") and lines:
+            ans = norm_space(lines[0])
+            m = re.search(r"(Routing Number|Phone)[^0-9]{0,20}" + rx.pattern, ans, re.I)
+            if m:
+                ans = m.group(0)
+            if kind == "routing":
+                ans = f"Dupaco's routing number is {rx.search(ans).group(0)}."
         else:
-            ans = self._best_sentences(q, u.text, k=1 if kind == "routing" else 2, must=rx)
+            ans = self._best_sentences(q, u.text, k=2, must=rx)
         return Result(ans, [(u.url, self._sid(q), ans[:200])], True)
 
     def _hours_answer(self, q: Query) -> Result:
@@ -665,6 +680,15 @@ class Answerer:
             return norm_space(m.group(1)).rstrip(" ;,.") if m else ""
         return norm_space(t)[:420]
 
+    def _count_hits(self, q: Query, sent: str) -> int:
+        toks = tokens(sent, keep_stop=True)
+        nouns = set(q.content)
+        best = 0
+        for i, t in enumerate(toks):
+            if re.fullmatch(r"\d[\d,]*", t):
+                best = max(best, sum(1 for n in nouns if n in toks[i + 1:i + 4]))
+        return best
+
     def _count_sentence(self, q: Query, text: str) -> Optional[str]:
         nouns = [t for t in q.content if not re.fullmatch(r"[\d.,]+", t)]
         best = None
@@ -695,7 +719,7 @@ class Answerer:
                     continue
                 # counts drift over time: the most recently published statement wins
                 when = pv.pub or (date(1900, 1, 1) if pv.kind in ("news", "blog", "file") else snap_date)
-                key = (when, s)
+                key = (sent_hits := self._count_hits(q, sent), round(self._coverage(q, sent), 1), when, s)
                 if best is None or key > best[0]:
                     best = (key, sent, u)
             if best:
@@ -706,7 +730,9 @@ class Answerer:
         for s, u, pv in hits[:40]:
             ctx = u.text + " " + u.heading + " " + pv.title
             cov = self._coverage(q, ctx)
-            sc = s * (0.5 + cov) * (1.0 / (1.0 + 0.03 * u.pos))
+            sc = s * (0.5 + cov)
+            if pv.kind in ("news", "blog"):
+                sc *= 1.0 / (1.0 + 0.03 * u.pos)
             if require_pct and "%" not in u.text:
                 sc *= 0.2
             if best is None or sc > best[0]:
@@ -774,7 +800,9 @@ class Answerer:
                 continue
             sc *= auth
             if app_q and host and not host.startswith("www.") and host.endswith("dupaco.com"):
-                sc *= 2.5 if re.search(r"\bonline\b", q.text, re.I) else 1.6
+                sc *= 1.6
+            elif app_q and re.search(r"\bonline\b", q.text, re.I):
+                sc *= 0.5      # "do it online" -> the online application beats an info page
             if rate_q:
                 caps = set()
                 if tpv is not None:

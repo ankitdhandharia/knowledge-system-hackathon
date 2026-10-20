@@ -5,7 +5,8 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "harness")); sys.path.insert(0, str(ROOT / "submission"))
-CACHE = Path("/tmp/claude-0/-root/bcfa31aa-d0cd-4612-9acf-70da3cb935d6/scratchpad/ks.pkl")
+CACHE = ROOT / "results" / "ks.pkl"   # results/ is git-ignored
+CACHE.parent.mkdir(exist_ok=True)
 
 args = sys.argv[1:]
 as_of = None
