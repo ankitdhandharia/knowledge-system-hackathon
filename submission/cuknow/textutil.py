@@ -33,16 +33,33 @@ RATE_WORDS = {"rate", "rates", "apy", "apr", "dividend", "dividends", "yield", "
 _TOKEN = re.compile(r"[a-z0-9]+(?:[.'/][a-z0-9]+)*")
 
 
+_SUFFIXES = [("ibilities", ""), ("ibility", ""), ("abilities", ""), ("ability", ""), ("izations", ""),
+             ("ization", ""), ("ations", ""), ("ation", ""), ("itions", ""), ("ition", ""), ("izing", ""),
+             ("ized", ""), ("izes", ""), ("ize", ""), ("ible", ""), ("able", ""), ("ings", ""), ("ing", ""),
+             ("ied", "y"), ("ies", "y"), ("ed", ""), ("sses", "ss"), ("ches", "ch"), ("shes", "sh"),
+             ("xes", "x"), ("ss", "ss"), ("us", "us"), ("is", "is"), ("s", "")]
+
+
 def stem(w: str) -> str:
-    if len(w) > 4 and w.endswith("ies"):
-        return w[:-3] + "y"
-    if len(w) > 3 and w.endswith("s") and not w.endswith(("ss", "us", "is")):
-        return w[:-1]
+    """Light suffix stripper so 'recognized'/'recognition', 'flexible'/'flexibility',
+    'branches'/'branch' and 'savings'/'saving' meet."""
+    if any(ch.isdigit() for ch in w) or len(w) <= 3:
+        return w
+    for suf, rep in _SUFFIXES:
+        if w.endswith(suf):
+            base = w[: len(w) - len(suf)] + rep
+            if len(base) >= 4 or suf == "s" and len(base) >= 3:
+                w = base
+                break
+    if len(w) > 4 and w.endswith("e"):
+        w = w[:-1]
     return w
 
 
 def words(text: str) -> list[str]:
-    return _TOKEN.findall((text or "").lower().replace("’", "'"))
+    t = (text or "").lower().replace("’", "'")
+    t = re.sub(r"(?<=[a-z])\$(?=[a-z])", "s", t)          # Home$tart -> homestart
+    return _TOKEN.findall(t)
 
 
 def tokens(text: str, keep_stop: bool = False) -> list[str]:

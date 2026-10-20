@@ -15,6 +15,8 @@ from .textutil import (clean_cell, clean_markdown, norm_space, parse_date, split
                        tokens, _DATE_LONG)
 
 BOILERPLATE_MIN_PAGES = 25
+GENERIC_CAPTIONS = {"rates", "loan rates", "home loans", "deposit rates", "savings accounts", "checking accounts",
+                    "certificates", "credit cards", "item", "value"}
 
 LANDING = {"switch-and-earn", "earn-more", "money-makeover", "mortgage-refi", "sprint-to-savings-challenge",
            "21-day-sprint-to-savings-challenge", "brighttrack", "checking", "loans", "personal-loans",
@@ -78,6 +80,7 @@ class Unit:
     heading: str
     text: str
     kind: str                # 'para' | 'row'
+    pos: int = 0             # order of first appearance within its page
     pids: set = field(default_factory=set)
 
 
@@ -120,6 +123,7 @@ class Store:
         self._unit_key: dict = {}
         self._table_key: dict = {}
         self._latest_md: dict = {}           # url -> (md5, pid)
+        self.page_units: dict = defaultdict(list)   # pid -> [uid, ...] in page order
         self.boiler: set = set()
         # BM25
         self.postings: dict = defaultdict(list)
@@ -176,6 +180,7 @@ class Store:
     # ------------------------------------------------------------------ units + tables
     def _index_page(self, pv: PageVersion, taken: date) -> None:
         lines = pv.text.split("\n")
+        self._unit_pos = 0
         heading = pv.title
         self._group = ""
         i, n = 0, len(lines)
@@ -211,7 +216,7 @@ class Store:
             elif ln not in self.boiler:
                 cur.append(ln)
                 kv = re.match(r"^([A-Za-z][^:|]{2,80}):\s+(.*\d.*)$", ln)
-                if kv and re.search(r"\d%|\$\d", kv.group(2)) and len(kv.group(2)) < 90:
+                if kv and pv.kind not in ("blog", "news", "calculator", "listing") and re.search(r"\d%|\$\d", kv.group(2)) and len(kv.group(2)) < 90:
                     self._add_table(pv, taken, lines, i, i, heading, ["Item", "Value"],
                                     [[clean_cell(kv.group(1)), clean_cell(kv.group(2))]], kv_line=True)
             i += 1
@@ -294,7 +299,7 @@ class Store:
         if uid is None:
             uid = len(self.units)
             self._unit_key[key] = uid
-            u = Unit(uid, pv.url, heading, text, kind)
+            u = Unit(uid, pv.url, heading, text, kind, self._unit_pos)
             self.units.append(u)
             toks = Counter(tokens(text))
             for t in tokens(heading):
@@ -306,13 +311,22 @@ class Store:
             for t, tf in toks.items():
                 self.postings[t].append((uid, tf))
         self.units[uid].pids.add(pv.pid)
+        self.page_units[pv.pid].append(uid)
+        self._unit_pos += 1
 
     # ------------------------------------------------------------------ table families
     @staticmethod
     def _row_label(t: Table, r: list) -> str:
-        cells = [c for c in r if c and "%" not in c and not re.fullmatch(r"[$\d.,\s—–-]+", c)]
-        lab = " ".join(cells[:3]).lower()
-        lab = re.sub(r"\b(19|20)\d\d\s*[-–]\s*\d\d(\d\d)?\b", "YR", lab)
+        """Product + tier/term part of a row (no rates, no min-balance / payment columns)."""
+        cells = []
+        for h, c in zip(t.headers, r):
+            if not c or "%" in c or re.search(r"points|payment|min\.? to|minimum", h, re.I):
+                continue
+            cells.append(c)
+        lab = " ".join(cells).lower().replace("–", "-").replace("—", "-")
+        lab = re.sub(r"\b(19|20)\d\d\s*-\s*\d\d(\d\d)?\b", "YR", lab)
+        lab = re.sub(r"(\d),(\d)", r"\1\2", lab)
+        lab = re.sub(r"\.00\b", "", lab)
         return re.sub(r"[^a-z0-9$+ ]+", " ", lab).strip()
 
     def _assign_families(self) -> None:
@@ -320,7 +334,7 @@ class Store:
         other pages are compared with — and superseded by — the authoritative one."""
         sigs = []
         for t in self.tables:
-            labels = {self._row_label(t, r) for r in t.rows}
+            labels = {self._row_label(t, r) for r in t.rows} - {""}
             sigs.append((labels, re.sub(r"[^a-z ]", "", t.caption.lower()).strip()))
         parent = list(range(len(self.tables)))
 
@@ -333,6 +347,13 @@ class Store:
         for i, (labels, _) in enumerate(sigs):
             for lab in labels:
                 by_label[lab].append(i)
+        by_caption = defaultdict(list)
+        for i, (_, cap) in enumerate(sigs):
+            if self.tables[i].is_rate and len(cap) >= 8 and cap not in GENERIC_CAPTIONS:
+                by_caption[cap].append(i)
+        for members in by_caption.values():
+            for j in members[1:]:
+                parent[find(j)] = find(members[0])
         for i, (li, ci) in enumerate(sigs):
             if not self.tables[i].is_rate:
                 continue
@@ -342,7 +363,7 @@ class Store:
                 if not self.tables[j].is_rate:
                     continue
                 jac = len(li & lj) / max(1, len(li | lj))
-                if jac >= 0.5 and len(self.tables[i].headers) == len(self.tables[j].headers):
+                if jac >= 0.5 and (len(li & lj) >= 2 or len(li | lj) == 1):
                     parent[find(i)] = find(j)
         for i, t in enumerate(self.tables):
             t.family = find(i)

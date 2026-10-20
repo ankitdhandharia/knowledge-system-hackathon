@@ -34,6 +34,15 @@ class TemporalKnowledge:
         self._cache: dict = {}
         self._lock = threading.Lock()
 
+    def __getstate__(self):
+        st = dict(self.__dict__)
+        st.pop("_lock", None)
+        return st
+
+    def __setstate__(self, st):
+        self.__dict__.update(st)
+        self._lock = threading.Lock()
+
     def ingest(self, snapshot: Snapshot) -> None:
         with self._lock:
             self.store.ingest(snapshot.snapshot_id, snapshot.taken_on, snapshot.pages)

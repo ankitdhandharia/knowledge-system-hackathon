@@ -21,8 +21,8 @@ from .store import PageVersion, Store, Table, Unit
 from .textutil import (RATE_WORDS, amount_range, money_values, norm_space, question_as_of, replace_number_words,
                        split_sentences, stem, terms_in, to_date, tokens, words, year_range, years_in)
 
-SYN = {
-    "cd": ["certificate"], "certificate": ["cd"], "share": [],
+_SYN_RAW = {
+    "cd": ["certificate"], "cds": ["certificate", "cd"], "certificate": ["cd"], "share": [],
     "mortgage": ["home", "conventional", "purchase"], "house": ["home"], "home": ["mortgage"],
     "car": ["auto", "vehicle"], "vehicle": ["auto"], "auto": ["vehicle"], "truck": ["auto"], "suv": ["auto"],
     "motorcycle": ["auto"], "heloc": ["home", "equity", "line", "credit"],
@@ -32,7 +32,7 @@ SYN = {
     "atv": ["snowmobile", "jet", "ski"], "snowmobile": ["atv"],
     "hsa": ["health", "saving"], "health": ["hsa"],
     "kid": ["dopack", "youth", "child"], "child": ["kid", "dopack"], "teen": ["youth"],
-    "join": ["member", "membership", "become"], "membership": ["join", "member", "eligible"],
+    "join": ["member", "membership", "become"], "member": ["join", "membership"], "membership": ["join", "member", "eligible"],
     "eligible": ["membership", "join", "eligibility"], "eligibility": ["eligible", "membership"],
     "locator": ["location", "branch", "atm"], "location": ["branch", "locator"],
     "student": ["college", "school"], "college": ["student"], "university": ["student", "college"],
@@ -45,16 +45,23 @@ SYN = {
     "lobby": ["branch"], "drive": ["drive-up", "drive-through"], "money": [],
 }
 
-GENERIC = {"current", "currently", "today", "right", "now", "much", "offer", "offered", "available", "provide",
+SYN = {stem(k): [stem(v) for v in vs] for k, vs in _SYN_RAW.items()}
+
+GENERIC_RAW = {"current", "currently", "today", "right", "now", "much", "offer", "offered", "available", "provide",
            "rate", "rates", "apy", "apr", "dividend", "yield", "interest", "earn", "pay", "percentage", "percent",
            "annual", "number", "kind", "type", "option", "new", "standard", "look", "find", "see", "show",
            "charge", "month", "year", "like", "would", "let", "repeat", "say", "said", "quote", "give", "us",
-           "list", "tell", "time", "most", "best", "highest", "lowest", "top", "minimum", "maximum", "cheapest"}
+           "list", "tell", "time", "most", "best", "highest", "lowest", "top", "minimum", "maximum", "cheapest",
+               "tier", "tiers", "balance", "dupaco", "aprs", "apys", "use", "should", "go", "link", "url", "website",
+               "web", "page", "site", "online", "become", "currently", "info", "information", "details"}
+GENERIC = {stem(w) for w in GENERIC_RAW}
+RATE_STEMS = {stem(w) for w in RATE_WORDS}
 
 CRITICAL = {"adjustable", "arm", "construction", "land", "lot", "farm", "agricultural", "agriculture",
             "commercial", "variable", "fha", "va", "usda", "balloon", "bridge", "reverse", "payday", "title",
             "interest-only", "7/1", "5/1", "10/1", "3/1", "5/5", "jumbo", "sba", "lease", "leasing", "crypto",
             "bitcoin", "gold", "foreign", "wire"}
+CRITICAL = {stem(w) for w in CRITICAL}
 
 # table-level concepts: (trigger words in the question, regex over table caption/group/url)
 CONCEPTS = [
@@ -82,6 +89,9 @@ STREET_RX = re.compile(r"\b\d{2,6}\s+(?:[NSEW]\.?\s+)?[A-Z][A-Za-z.]*(?:\s+[A-Z]
 PHONE_RX = re.compile(r"\(?\b\d{3}\)?[-.\s]\d{3}[-.\s]\d{4}\b")
 ROUTING_RX = re.compile(r"\b\d{9}\b")
 NUM_RX = re.compile(r"\b\d[\d,]*\b")
+
+TYPE_WORDS = frozenset(stem(w) for w in ("address", "located", "location", "phone", "telephone", "number", "call",
+                                          "hours", "hour", "routing", "open", "close"))
 
 REFUSAL = ("I'm sorry, but that isn't listed on the website, so I can't confirm it. "
            "Please contact us or visit a branch and a Dupaco team member can help.")
@@ -150,7 +160,7 @@ class Answerer:
             r = self._typed_passage(q, ROUTING_RX, "routing")
             if r:
                 return r
-        rate_q = bool(set(words(ql)) & RATE_WORDS) and not re.search(r"\bfees?\b", ql)
+        rate_q = bool(set(tokens(ql, keep_stop=True)) & RATE_STEMS) and not re.search(r"\bfees?\b", ql)
         if rate_q:
             r = self._rate_answer(q)
             if r:
@@ -180,12 +190,12 @@ class Answerer:
                 when = qd
         sidx = self.s.snapshot_for(when)
         toks = tokens(text)
-        content = [t for t in toks if t not in GENERIC and not t.isdigit()]
+        content = [t for t in toks if t not in GENERIC and not re.fullmatch(r"[\d.,/]+", t)]
         weights: dict = defaultdict(float)
         for t in toks:
-            weights[t] = max(weights[t], 0.35 if t in GENERIC else 1.0)
+            weights[t] = max(weights[t], 0.35 if t in GENERIC else 0.6 if re.fullmatch(r"[\d.,/]+", t) else 1.0)
             for sy in SYN.get(t, []):
-                weights[stem(sy)] = max(weights[stem(sy)], 0.5)
+                weights[sy] = max(weights.get(sy, 0.0), 0.5)
         # phrase hints
         ql = text.lower()
         if "credit card" in ql or "credit cards" in ql:
@@ -243,12 +253,12 @@ class Answerer:
             self._tidf_cache[sidx] = {w: math.log(1 + n / d) for w, d in df.items()}
         return self._tidf_cache[sidx]
 
-    def _concept_penalty(self, q: Query, ctx: dict) -> float:
+    def _concept_penalty(self, q: Query, ctx: dict, list_q: bool = False) -> float:
         qset = set(q.toks)
         pen = 1.0
         for trig, rx in CONCEPTS:
             if re.search(rx, ctx["concept"]) and not (qset & {stem(w) for w in trig}):
-                pen *= 0.45
+                pen *= 0.9 if (list_q and "business" in trig) else 0.45
         return pen
 
     def _match_table(self, q: Query, t: Table, pv: PageVersion, idf: dict) -> float:
@@ -257,7 +267,7 @@ class Answerer:
         for tok in set(q.content):
             w = idf.get(tok, 2.5)
             den += w
-            alts = [tok] + [stem(s) for s in SYN.get(tok, [])]
+            alts = [tok] + SYN.get(tok, [])
             best = 0.0
             for i, a in enumerate(alts):
                 f = 1.0 if i == 0 else 0.7
@@ -272,7 +282,10 @@ class Answerer:
             num += w * best
         if den == 0:
             return 0.0
-        return num / den
+        qall = set(q.toks) | {x for t in q.toks for x in SYN.get(t, [])}
+        cap = c["cap"] - GENERIC
+        cap_prec = len(cap & qall) / len(cap) if cap else 0.0
+        return (num / den) * (0.85 + 0.15 * cap_prec)
 
     def _row_cells_text(self, r: list) -> str:
         return " ".join(c for c in r if "%" not in c)
@@ -375,6 +388,7 @@ class Answerer:
         if not live:
             return None
         idf = self._table_idf(q.sidx, live)
+        list_q = bool(LIST_WORDS.search(q.text)) or bool(re.search(r"\b(cards|loans|certificates|cds|accounts)\b", q.text, re.I))
         fams: dict = defaultdict(list)
         for t, pv in live:
             if t.expired:
@@ -384,7 +398,7 @@ class Answerer:
             if m <= 0.2:
                 continue
             rows, fit = self._filter_rows(q, t)
-            score = m * fit * self._concept_penalty(q, c) * (0.55 + 0.45 * pv.authority)
+            score = m * fit * self._concept_penalty(q, c, list_q) * (0.3 + 0.7 * pv.authority)
             fams[self._family_key(t, c)].append((score, t, pv, rows, c))
         if not fams:
             return None
@@ -394,13 +408,13 @@ class Answerer:
             # representative: newest effective date, then most authoritative page, then best match
             rep = max(members, key=lambda m: (m[1].effective or date(1900, 1, 1), m[2].authority, m[0], -m[1].tid))
             ranked.append((best_score, rep, members))
-        ranked.sort(key=lambda x: (-x[0], x[1][1].tid))
+        # ties (e.g. "savings" matches every savings product) go to the table listed first on the page
+        ranked.sort(key=lambda x: (-round(x[0], 3), self._table_order(x[1][1]), x[1][1].tid))
         top = ranked[0][0]
         if top < 0.5:
             return None
         if self._critical_unmatched(q, [ranked[0][1][4]]):
             return Result(REFUSAL, confident=False)
-        list_q = bool(LIST_WORDS.search(q.text)) or re.search(r"\b(cards|loans|certificates|cds|accounts)\b", q.text, re.I)
         cut = 0.7 if list_q else 0.85
         chosen = [x for x in ranked if x[0] >= cut * top][: (6 if list_q else 3)]
         parts, sources, notes = [], [], []
@@ -414,13 +428,16 @@ class Answerer:
             if sig in seen_caps:
                 continue
             seen_caps.add(sig)
-            eff = f" (effective {t.effective.strftime('%m/%d/%Y')})" if t.effective else ""
+            eff = f" (rates effective {t.effective.strftime('%m/%d/%Y')})" if t.effective else ""
             cap = t.caption if t.caption.lower() not in rendered[0].lower() else ""
+            if cap and t.group and t.group.lower() not in cap.lower() and len(t.group) < 40 \
+                    and not re.search(r"account|rates$", t.group, re.I):
+                cap = f"{cap} ({t.group})"
             if change_q:
                 hist = self._history(t, rows, q.sidx)
                 if hist:
                     rendered = [rendered[0] + f" — {hist}"] + rendered[1:]
-            parts.append((f"{cap}{eff}: " if cap else (eff.strip() + ": " if eff else "")) + "; ".join(rendered))
+            parts.append((f"{cap}: " if cap else "") + "; ".join(rendered) + eff)
             # cite the representative and other live pages that show the same current values
             same = sorted({m[2].url for m in members if self._render_rows(m[1], m[1].rows) == self._render_rows(t, t.rows)}
                           | {pv.url}, key=lambda u: -self.s.page_for(u, q.sidx).authority if self.s.page_for(u, q.sidx) else 0)
@@ -436,7 +453,17 @@ class Answerer:
         if not parts:
             return None
         text = " ".join(p.rstrip(".") + "." for p in parts)
+        # "Do any ... pay 0.35%?" style checks: say yes/no without echoing the questioned value
+        asked = [float(x) for x in re.findall(r"(\d+(?:\.\d+)?)\s?%", q.text)]
+        if asked and re.match(r"\s*(do|does|is|are|can|will)\b", q.text, re.I):
+            shown = {float(x) for x in re.findall(r"(\d+(?:\.\d+)?)\s?%", text)}
+            text = ("Yes. " if all(a in shown for a in asked) else "No, that rate isn't on the current rate sheet. ") + text
         return Result(text, sources[:5], True, " ".join(notes) or None)
+
+    def _table_order(self, t: Table) -> int:
+        """Position of the table among the rate tables of its page (0 = first)."""
+        same = [x.tid for x in self.s.tables if x.url == t.url and x.is_rate and x.pids & t.pids]
+        return same.index(t.tid) if t.tid in same else 99
 
     def _history(self, t: Table, rows: list, sidx: int) -> str:
         """Earlier values of the same rows in older snapshots (only for 'did it change' questions)."""
@@ -471,13 +498,13 @@ class Answerer:
         out.sort(key=lambda x: (-x[0], x[1].uid))
         return out
 
-    def _coverage(self, q: Query, text: str) -> float:
+    def _coverage(self, q: Query, text: str, skip: frozenset = frozenset()) -> float:
         have = set(tokens(text))
         num = den = 0.0
-        for t in set(q.content):
+        for t in set(q.content) - skip:
             w = self.s.idf(t)
             den += w
-            if t in have or any(stem(sy) in have for sy in SYN.get(t, [])):
+            if t in have or any(sy in have for sy in SYN.get(t, [])):
                 num += w
         return num / den if den else 0.0
 
@@ -497,6 +524,34 @@ class Answerer:
         keep = sorted(sorted(scored, key=lambda x: (-x[0], x[1]))[:k], key=lambda x: x[1])
         return norm_space(" ".join(s for _, _, s in keep))
 
+    def _page_sentences(self, q: Query, u: Unit, pv: PageVersion, k: int = 3) -> str:
+        """Best sentences from the chosen page: the chosen passage is favoured, a news lead paragraph
+        is favoured, and the output keeps page order."""
+        if len(u.text) <= 320 and self._coverage(q, u.text) >= 0.99:
+            return norm_space(u.text.replace("\n", " "))
+        cands = []
+        for uid in self.s.page_units.get(pv.pid, [u.uid]):
+            v = self.s.units[uid]
+            if v.kind != "para":
+                continue
+            lines = [ln for ln in v.text.split("\n") if ln.strip()]
+            sents = []
+            for ln in lines:
+                sents.extend(split_sentences(ln) if len(ln) > 220 else [ln])
+            for j, sent in enumerate(sents):
+                if len(sent) < 25 and v.uid != u.uid:
+                    continue
+                sc = self._coverage(q, sent) + (0.35 if v.uid == u.uid else 0.0)
+                if pv.kind == "news" and v.pos <= 1:
+                    sc += 0.15
+                sc -= 0.004 * v.pos
+                cands.append((sc, v.pos, j, sent))
+        if not cands:
+            return self._best_sentences(q, u.text, k=k)
+        top = sorted(cands, key=lambda x: (-x[0], x[1], x[2]))[:k]
+        top = [c for c in top if c[0] >= top[0][0] - 0.6]
+        return norm_space(" ".join(c[3] for c in sorted(top, key=lambda x: (x[1], x[2]))))
+
     def _entities(self, q: Query) -> list[str]:
         """Capitalised names in the question (e.g. 'Galena', 'Hy-Vee', 'Mullan Avenue')."""
         ents = []
@@ -510,28 +565,42 @@ class Answerer:
         return ents
 
     def _typed_passage(self, q: Query, rx: re.Pattern, kind: str) -> Optional[Result]:
-        hits = self._rescore(q, self.s.bm25(q.weights, q.sidx))
+        hits = self._rescore(q, self.s.bm25(q.weights, q.sidx, limit=120))
         ents = self._entities(q)
-        for s, u, pv in hits[:80]:
+        want_branch = bool(re.search(r"\bbranch", q.text, re.I))
+        best = None
+        for rank, (s, u, pv) in enumerate(hits[:120]):
             txt = u.text
             if not rx.search(txt):
                 continue
             hay = set(tokens(txt + " " + u.heading + " " + pv.title))
             if ents and not all(set(e.split()) <= hay for e in ents):
                 continue
-            if self._coverage(q, txt + " " + u.heading + " " + pv.title) < 0.4:
+            if self._coverage(q, txt + " " + u.heading + " " + pv.title, skip=TYPE_WORDS) < 0.4:
                 continue
-            ans = self._best_sentences(q, txt, k=2, must=rx)
-            if kind == "address":
-                lines = [ln for ln in txt.split("\n") if rx.search(ln)]
-                if ents:
-                    ent_lines = [ln for ln in lines if any(set(e.split()) & set(tokens(ln)) for e in ents)]
-                    lines = ent_lines or lines
-                ans = lines[0] if lines else ans
-            return Result(ans, [(u.url, self._sid(q), ans[:200])], True)
-        if ents and kind in ("address", "phone"):
-            return Result(REFUSAL, confident=False)
-        return None
+            sc = s * (0.5 + pv.authority)
+            lines = [ln for ln in txt.split("\n") if rx.search(ln)]
+            if ents:
+                ent_lines = [ln for ln in lines if any(set(e.split()) & set(tokens(ln)) for e in ents)]
+                lines = ent_lines or lines
+            if want_branch and lines:
+                i = pv.text.find(lines[0])
+                if i >= 0 and re.search(r"\bbranch", pv.text[max(0, i - 80):i], re.I):
+                    sc *= 2.0
+            if best is None or sc > best[0]:
+                best = (sc, u, pv, lines)
+        if best is None:
+            if ents and kind in ("address", "phone"):
+                return Result(REFUSAL, confident=False)
+            return None
+        _, u, pv, lines = best
+        if kind == "address" and lines:
+            ans = lines[0]
+            if ents:
+                ans = f"The {' '.join(w.capitalize() for w in ents[0].split())} branch is at {ans}."
+        else:
+            ans = self._best_sentences(q, u.text, k=1 if kind == "routing" else 2, must=rx)
+        return Result(ans, [(u.url, self._sid(q), ans[:200])], True)
 
     def _hours_answer(self, q: Query) -> Result:
         ents = self._entities(q)
@@ -553,47 +622,91 @@ class Answerer:
         if ents:
             s, u, pv = cands[0]
             return Result(self._hours_text(u.text, drive), [(u.url, self._sid(q), u.text[:200])], True)
-        # general question: summarise the distinct schedules found
-        schedules, srcs = [], []
+        # general question: summarise distinct schedules (they differ mostly on Fri/Sat)
+        schedules, srcs, keys = [], [], []
         for s, u, pv in cands:
             block = self._hours_text(u.text, drive, section_only=True)
-            key = re.sub(r"\W+", "", block.lower())
-            if block and key not in [re.sub(r"\W+", "", b.lower()) for b in schedules]:
-                schedules.append(block)
-                srcs.append((u.url, self._sid(q), block[:200]))
+            if not block:
+                continue
+            sat = re.search(r"saturday[^A-Z]*", block, re.I)
+            key = re.sub(r"\W+", "", (sat.group(0) if sat else block).lower())
+            if key in keys:
+                continue
+            keys.append(key)
+            schedules.append(block)
+            srcs.append((u.url, self._sid(q), block[:200]))
             if len(schedules) >= 2:
                 break
+        if not schedules:
+            return Result(REFUSAL, confident=False)
+        locator = self._locator_url(q)
+        if locator:
+            srcs.insert(0, (locator, self._sid(q), None))
         kind = "Drive-up" if drive else "Lobby"
-        text = (f"{kind} hours vary by branch. A typical schedule is: {schedules[0]}"
-                + (f" Another branch schedule: {schedules[1]}" if len(schedules) > 1 else "")
+        text = (f"{kind} hours vary by branch. A typical schedule is: {schedules[0]}."
+                + (f" Another branch schedule: {schedules[1]}." if len(schedules) > 1 else "")
                 + " Which branch would you like hours for?")
         return Result(text, srcs, True)
+
+    def _locator_url(self, q: Query) -> Optional[str]:
+        for url in self.s.views[q.sidx]:
+            if re.search(r"dupaco\.com/contact/?$", url):
+                return url
+        return None
 
     @staticmethod
     def _hours_text(text: str, drive: bool, section_only: bool = False) -> str:
         t = text.replace("\n", " ")
         t = re.sub(r"^.*?(Branch hours are:|hours are:|Hours:)", "", t, flags=re.I)
-        lob = re.search(r"Lobby\s*(.*?)(?=Drive[- ]?(up|thru|through)|$)", t, re.I)
-        drv = re.search(r"Drive[- ]?(?:up|thru|through)\s*(.*?)(?=Lobby|ABOUT|$)", t, re.I)
+        lob = re.search(r"Lobby:?\s*(.*?)(?=Drive[- ]?(up|thru|through)|$)", t, re.I)
+        drv = re.search(r"Drive[- ]?(?:up|thru|through):?\s*(.*?)(?=Lobby|ABOUT|$)", t, re.I)
         if section_only:
             m = drv if drive else lob
-            if m:
-                return norm_space(m.group(1) if drive else m.group(1)).rstrip(" ;,")
-            return ""
+            return norm_space(m.group(1)).rstrip(" ;,.") if m else ""
         return norm_space(t)[:420]
 
+    def _count_sentence(self, q: Query, text: str) -> Optional[str]:
+        nouns = [t for t in q.content if not re.fullmatch(r"[\d.,]+", t)]
+        best = None
+        for sent in split_sentences(text.replace("\n", " ")):
+            if STREET_RX.search(sent) or PHONE_RX.search(sent) or len(sent.split()) < 6:
+                continue
+            toks = tokens(sent, keep_stop=True)
+            for i, t in enumerate(toks):
+                if not re.fullmatch(r"\d[\d,]*", t) or t in ("0",) or re.fullmatch(r"(19|20)\d\d", t):
+                    continue
+                window = toks[i + 1:i + 4]
+                hit = sum(1 for n in nouns if n in window)
+                if hit and (best is None or hit > best[0]):
+                    best = (hit, sent)
+        return best[1] if best else None
+
     def _passage_answer(self, q: Query, require_pct: bool = False) -> Result:
-        hits = self._rescore(q, self.s.bm25(q.weights, q.sidx))
+        hits = self._rescore(q, self.s.bm25(q.weights, q.sidx, limit=100))
         if not hits:
             return Result(REFUSAL, confident=False)
         count_q = bool(re.search(r"\bhow many\b", q.text, re.I))
+        if count_q:
+            snap_date = self.s.snapshots[q.sidx][1]
+            best = None
+            for s, u, pv in hits[:150]:
+                sent = self._count_sentence(q, u.text)
+                if not sent:
+                    continue
+                # counts drift over time: the most recently published statement wins
+                when = pv.pub or (date(1900, 1, 1) if pv.kind in ("news", "blog", "file") else snap_date)
+                key = (when, s)
+                if best is None or key > best[0]:
+                    best = (key, sent, u)
+            if best:
+                _, sent, u = best
+                sent = re.sub(r"^(It|The credit union)\b", "Dupaco", norm_space(sent))
+                return Result(sent, [(u.url, self._sid(q), sent[:200])], True)
         best = None
         for s, u, pv in hits[:40]:
             ctx = u.text + " " + u.heading + " " + pv.title
             cov = self._coverage(q, ctx)
-            sc = s * (0.5 + cov)
-            if count_q and not NUM_RX.search(u.text):
-                sc *= 0.3
+            sc = s * (0.5 + cov) * (1.0 / (1.0 + 0.03 * u.pos))
             if require_pct and "%" not in u.text:
                 sc *= 0.2
             if best is None or sc > best[0]:
@@ -605,38 +718,74 @@ class Answerer:
         hay = set(tokens(u.text + " " + u.heading + " " + pv.title))
         if ents and not any(set(e.split()) <= hay for e in ents) and cov < 0.6:
             return Result(REFUSAL, confident=False)
-        k = 1 if count_q else 3
-        ans = self._best_sentences(q, u.text, k=k, must=NUM_RX if count_q else None)
+        ans = self._page_sentences(q, u, pv, k=3)
+        head = re.sub(r"\s*[|–-]\s*Dupaco.*$", "", u.heading or pv.title).strip()
+        if head and len(head) < 60 and head.lower() not in ans.lower() and not head.endswith("?"):
+            ans = f"{head}: {ans}"
         if re.search(r"\b(online|apply|sign up|enroll|join)\b", q.text, re.I):
-            link = self._best_link(q, prefer_external=True)
+            link = self._best_link(q)
             if link and link not in ans:
                 ans += f" You can do this online at {link}"
         return Result(ans, [(u.url, self._sid(q), ans[:200])], True)
 
     # ================================================================== links
     def _link_scores(self, q: Query) -> dict:
-        qset = set(q.content) | {stem(s) for t in q.content for s in SYN.get(t, [])}
-        if "rate" in q.toks or "rates" in q.text.lower():
+        qset = set(q.content) | {s for t in q.content for s in SYN.get(t, [])}
+        rate_q = bool(re.search(r"\brates?\b", q.text, re.I))
+        if rate_q:
             qset.add("rate")
+        if not qset:
+            return {}
+        app_q = bool(re.search(r"\b(online|apply|application|open|sign up|enroll)\b", q.text, re.I))
         agg: dict = defaultdict(float)
         seen = set()
-        for url, pid in self.s.views[q.sidx].items():
+        view = self.s.views[q.sidx]
+        for url, pid in view.items():
             pv = self.s.pages[pid]
             if pv.kind in ("expired", "modal", "listing"):
                 continue
             for text, target in pv.links:
-                if target.startswith(("tel:", "mailto:", "#")):
+                if target.startswith(("tel:", "mailto:", "#")) or not text:
                     continue
                 tgt = _norm_url(target)
-                lt = set(tokens(text + " " + urlparse(tgt).path.replace("-", " ").replace("/", " ")))
-                ov = len(qset & lt)
+                lt = set(tokens(text + " " + (tgt.split("#", 1)[1] if "#" in tgt else "")))
+                ov = len(qset & lt) / max(1.0, min(len(qset), 3))
                 if ov == 0 or (pv.url, tgt) in seen:
                     continue
                 seen.add((pv.url, tgt))
                 agg[tgt] += ov * (0.5 + pv.authority)
-        return agg
+        out = {}
+        for tgt, sc in agg.items():
+            base = tgt.split("#")[0]
+            host = urlparse(tgt).netloc.lower()
+            tpv = None
+            for cand in (base, base.rstrip("/"), base.rstrip("/") + "/"):
+                if cand in view:
+                    tpv = self.s.pages[view[cand]]
+                    break
+            if tpv is not None:
+                kind, auth = tpv.kind, tpv.authority
+            else:
+                from .store import classify
+                kind, auth = classify(tgt)
+                if host and not host.startswith("www."):
+                    auth = 0.8          # application sub-sites (join., shine., homeloans.)
+            if kind in ("listing", "expired", "modal"):
+                continue
+            sc *= auth
+            if app_q and host and not host.startswith("www.") and host.endswith("dupaco.com"):
+                sc *= 2.5 if re.search(r"\bonline\b", q.text, re.I) else 1.6
+            if rate_q:
+                caps = set()
+                if tpv is not None:
+                    for t in self.s.tables:
+                        if t.is_rate and tpv.pid in t.pids:
+                            caps |= set(tokens(t.caption + " " + t.group))
+                sc *= 1.5 if caps & qset else 1.0 if caps else 0.4
+            out[tgt] = sc
+        return out
 
-    def _best_link(self, q: Query, prefer_external: bool = False) -> Optional[str]:
+    def _best_link(self, q: Query) -> Optional[str]:
         agg = self._link_scores(q)
         if not agg:
             return None
@@ -644,14 +793,6 @@ class Answerer:
 
     def _url_answer(self, q: Query) -> Optional[Result]:
         agg = self._link_scores(q)
-        # pages whose own title / path match the question are candidates too
-        for url, pid in self.s.views[q.sidx].items():
-            pv = self.s.pages[pid]
-            if pv.kind in ("expired", "modal", "listing"):
-                continue
-            ov = len(set(q.content) & set(tokens(pv.title + " " + urlparse(url).path.replace("-", " "))))
-            if ov:
-                agg[_norm_url(url)] += ov * pv.authority
         if not agg:
             return None
         best = max(agg.items(), key=lambda x: (x[1], -len(x[0]), x[0]))[0]
